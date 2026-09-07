@@ -1,82 +1,8 @@
 import type { PoolClient } from "pg";
-import { db, transaction, accountLock } from "./db";
-import { PLANS, entitlement, inSchedule, scorePost } from "./domain";
-import { provider, ProviderError, type SocialSearchProvider } from "./provider";
-
-export async function schedule() {
-  await db().query(`insert into scan_jobs(radar_id) select id from radars where enabled and next_scan_at<=now() order by next_scan_at limit 1000 on conflict do nothing`);
-}
-
-export async function scanNext(search?: SocialSearchProvider) {
-  return transaction(async (c) => {
-    const candidate = (await c.query("select j.radar_id,r.user_id from scan_jobs j join radars r on r.id=j.radar_id where j.available_at<=now() order by j.available_at limit 1")).rows[0];
-    if (!candidate) return false;
-    await accountLock(c, candidate.user_id);
-    const job = (await c.query("select * from scan_jobs where radar_id=$1 and available_at<=now() for update skip locked", [candidate.radar_id])).rows[0];
-    if (!job) return false;
-    const r = (await c.query("select * from radars where id=$1 for update", [job.radar_id])).rows[0];
-    if (!r) return false;
-    const s = (await c.query("select * from subscriptions where user_id=$1", [r.user_id])).rows[0];
-    const limits = PLANS[entitlement(s)];
-    const defer = async (reason: string, seconds: number) => {
-      await c.query("update radars set last_error=$2,next_scan_at=now()+make_interval(secs=>$3) where id=$1", [r.id, reason, seconds]);
-      await c.query("delete from scan_jobs where radar_id=$1", [r.id]);
-      return true;
-    };
-    if (!r.enabled) return defer("PAUSED", limits.interval);
-    if (!inSchedule(new Date(), r.timezone, r.active_schedule_json)) return defer("OUTSIDE_ACTIVE_HOURS", 30);
-    const eligible = (await c.query("select id from radars where user_id=$1 and enabled order by created_at,id limit $2", [r.user_id, limits.radars])).rows;
-    if (!eligible.some((x) => x.id === r.id)) return defer("PLAN_RADAR_LIMIT", 3600);
-    const used = Number((await c.query("select coalesce(sum(quantity),0) n from usage_events where user_id=$1 and type='scan' and occurred_at>=date_trunc('month',now() at time zone 'UTC') at time zone 'UTC'", [r.user_id])).rows[0].n);
-    if (used >= limits.scans) return defer("QUOTA_EXHAUSTED", 3600);
-    const interval = Math.max(limits.interval, r.scan_interval_seconds);
-    if (r.last_scan_at && +new Date(r.last_scan_at) + interval * 1000 > Date.now())
-      return defer("WAITING", Math.ceil((+new Date(r.last_scan_at) + interval * 1000 - Date.now()) / 1000));
-
-    const run = (await c.query("insert into scan_runs(user_id,radar_id,status,provider) values($1,$2,'scanning',$3) returning id", [r.user_id, r.id, r.provider])).rows[0].id;
-    const start = Date.now();
-    await c.query("insert into usage_events(user_id,radar_id,type) values($1,$2,'scan')", [r.user_id, r.id]);
-
-    let result;
-    try {
-      result = await (search || provider(r.provider)).search({ query: r.query, cursor: r.provider_cursor });
-    } catch (error) {
-      const e = error instanceof ProviderError
-        ? error
-        : new ProviderError("PROVIDER_UNAVAILABLE", true, 60, error instanceof Error ? `${error.name}: ${error.message}` : String(error));
-      const detail = (e.detail || e.code).slice(0, 2000);
-      await c.query(
-        "update scan_runs set status='failed',completed_at=now(),duration_ms=$2,error_code=$3,error_message=$4,retryable=$5 where id=$1",
-        [run, Date.now() - start, e.code, detail, e.retryable],
-      );
-      await c.query(
-        "update radars set last_scan_at=now(),last_error='PROVIDER_DELAYED',next_scan_at=now()+make_interval(secs=>$2) where id=$1",
-        [r.id, Math.max(interval, e.retryAfter, e.retryable ? 0 : 3600)],
-      );
-      await c.query("delete from scan_jobs where radar_id=$1", [r.id]);
-      console.error(JSON.stringify({ event: "provider_scan_failed", scan_run_id: run, radar_id: r.id, provider: r.provider, code: e.code, detail, retryable: e.retryable }));
-      return true;
-    }
-
-    let count = 0;
-    for (const p of result.posts) {
-      const post = (await c.query(`insert into posts(platform,external_id,author_id,username,display_name,text,url,posted_at,likes,replies,reposts,quotes,followers,verified) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) on conflict(platform,external_id) do update set likes=excluded.likes,replies=excluded.replies,reposts=excluded.reposts,quotes=excluded.quotes,updated_at=now() returning id`, [p.platform, p.externalId, p.authorId, p.username, p.displayName, p.text, p.url, p.createdAt, p.metrics.likes, p.metrics.replies, p.metrics.reposts, p.metrics.quotes, p.author.followers, p.author.verified])).rows[0].id;
-      if ((await c.query("select 1 from muted_authors where user_id=$1 and author_id=$2", [r.user_id, p.authorId])).rowCount) continue;
-      const { score, intent, components } = scorePost(p);
-      const match = (await c.query(`insert into matches(user_id,radar_id,post_id,score,intent,score_breakdown_json,notification_eligible) values($1,$2,$3,$4,$5,$6,$7) on conflict(radar_id,post_id) do nothing returning id`, [r.user_id, r.id, post, score, intent, JSON.stringify(components), score >= r.minimum_score])).rows[0];
-      if (!match) continue;
-      count++;
-    }
-
-    await c.query("update radars set last_scan_at=now(),last_successful_scan_at=now(),next_scan_at=now()+make_interval(secs=>$2),last_error=null,provider_cursor=$3 where id=$1", [r.id, interval, result.cursor || r.provider_cursor]);
-    await c.query("update scan_runs set status='completed',completed_at=now(),results_count=$2,new_matches_count=$3,duration_ms=$4 where id=$1", [run, result.posts.length, count, Date.now() - start]);
-    await c.query("insert into usage_events(user_id,radar_id,type,quantity) values($1,$2,'scan_completed',1),($1,$2,'match',$3)", [r.user_id, r.id, count]);
-    await c.query("delete from scan_jobs where radar_id=$1", [r.id]);
-    console.log(JSON.stringify({ scan_run_id: run, radar_id: r.id, provider: r.provider, duration: Date.now() - start, results_count: result.posts.length, new_matches: count, status: "completed" }));
-    return true;
-  });
-}
-
-export async function readLimits(c: PoolClient, id: string) {
-  return PLANS[entitlement((await c.query("select * from subscriptions where user_id=$1", [id])).rows[0])];
-}
+import { db,transaction,accountLock } from "./db";
+import { PLANS,entitlement,inSchedule,scorePost } from "./domain";
+import { provider,ProviderError,type SocialSearchProvider } from "./provider";
+const X_COST_PER_POST_CENTS=0.5; const CUSTOMER_MARKUP=2; const MIN_CHARGE_CENTS=1;
+export async function schedule(){await db().query(`insert into scan_jobs(radar_id) select id from radars where enabled and next_scan_at<=now() order by next_scan_at limit 1000 on conflict do nothing`)}
+export async function scanNext(search?:SocialSearchProvider){return transaction(async(c)=>{const candidate=(await c.query("select j.radar_id,r.user_id from scan_jobs j join radars r on r.id=j.radar_id where j.available_at<=now() order by j.available_at limit 1")).rows[0];if(!candidate)return false;await accountLock(c,candidate.user_id);const job=(await c.query("select * from scan_jobs where radar_id=$1 and available_at<=now() for update skip locked",[candidate.radar_id])).rows[0];if(!job)return false;const r=(await c.query("select * from radars where id=$1 for update",[job.radar_id])).rows[0];if(!r)return false;const s=(await c.query("select * from subscriptions where user_id=$1",[r.user_id])).rows[0];const limits=PLANS[entitlement(s)];const defer=async(reason:string,seconds:number)=>{await c.query("update radars set last_error=$2,next_scan_at=now()+make_interval(secs=>$3) where id=$1",[r.id,reason,seconds]);await c.query("delete from scan_jobs where radar_id=$1",[r.id]);return true};if(!r.enabled)return defer("PAUSED",limits.interval);if(!inSchedule(new Date(),r.timezone,r.active_schedule_json))return defer("OUTSIDE_ACTIVE_HOURS",30);const balance=Number((await c.query("select balance_cents from credit_accounts where user_id=$1 for update",[r.user_id])).rows[0]?.balance_cents||0);if(balance<=0)return defer("CREDITS_REQUIRED",3600);const interval=Math.max(600,r.scan_interval_seconds);if(r.last_scan_at&&+new Date(r.last_scan_at)+interval*1000>Date.now())return defer("WAITING",Math.ceil((+new Date(r.last_scan_at)+interval*1000-Date.now())/1000));const run=(await c.query("insert into scan_runs(user_id,radar_id,status,provider) values($1,$2,'scanning',$3) returning id",[r.user_id,r.id,r.provider])).rows[0].id;const start=Date.now();let result;try{result=await(search||provider(r.provider)).search({query:r.query,cursor:r.provider_cursor,limit:Math.min(100,r.max_results_per_scan||100)})}catch(error){const e=error instanceof ProviderError?error:new ProviderError("PROVIDER_UNAVAILABLE",true,60,error instanceof Error?`${error.name}: ${error.message}`:String(error));const d=(e.detail||e.code).slice(0,2000);await c.query("update scan_runs set status='failed',completed_at=now(),duration_ms=$2,error_code=$3,error_message=$4,retryable=$5 where id=$1",[run,Date.now()-start,e.code,d,e.retryable]);await c.query("update radars set last_scan_at=now(),last_error='PROVIDER_DELAYED',next_scan_at=now()+make_interval(secs=>$2) where id=$1",[r.id,Math.max(interval,e.retryAfter,e.retryable?0:3600)]);await c.query("delete from scan_jobs where radar_id=$1",[r.id]);return true}const billable=result.posts.length;const charge=Math.max(MIN_CHARGE_CENTS,Math.ceil(billable*X_COST_PER_POST_CENTS*CUSTOMER_MARKUP));if(balance<charge){await c.query("update scan_runs set status='failed',completed_at=now(),duration_ms=$2,error_code='INSUFFICIENT_CREDITS',error_message='Scan completed but balance is below calculated usage charge',results_count=$3,billable_posts=$3,cost_cents=$4 where id=$1",[run,Date.now()-start,billable,charge]);return defer("CREDITS_REQUIRED",3600)}let count=0;for(const p of result.posts){const {score,intent,components}=scorePost(p);if(score<r.minimum_score||intent==="GENERAL_DISCUSSION")continue;const post=(await c.query(`insert into posts(platform,external_id,author_id,username,display_name,text,url,posted_at,likes,replies,reposts,quotes,followers,verified) values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) on conflict(platform,external_id) do update set likes=excluded.likes,replies=excluded.replies,reposts=excluded.reposts,quotes=excluded.quotes,updated_at=now() returning id`,[p.platform,p.externalId,p.authorId,p.username,p.displayName,p.text,p.url,p.createdAt,p.metrics.likes,p.metrics.replies,p.metrics.reposts,p.metrics.quotes,p.author.followers,p.author.verified])).rows[0].id;const match=(await c.query(`insert into matches(user_id,radar_id,post_id,score,intent,score_breakdown_json,notification_eligible) values($1,$2,$3,$4,$5,$6,true) on conflict(radar_id,post_id) do nothing returning id`,[r.user_id,r.id,post,score,intent,JSON.stringify(components)])).rows[0];if(match)count++}await c.query("update credit_accounts set balance_cents=balance_cents-$2,lifetime_spent_cents=lifetime_spent_cents+$2,updated_at=now() where user_id=$1",[r.user_id,charge]);await c.query("insert into credit_ledger(user_id,amount_cents,kind,radar_id,scan_run_id,metadata) values($1,$2,'scan',$3,$4,$5)",[r.user_id,-charge,r.id,run,JSON.stringify({posts:billable,markup:CUSTOMER_MARKUP})]);await c.query("update radars set last_scan_at=now(),last_successful_scan_at=now(),next_scan_at=now()+make_interval(secs=>$2),last_error=null,provider_cursor=$3 where id=$1",[r.id,interval,result.cursor||r.provider_cursor]);await c.query("update scan_runs set status='completed',completed_at=now(),results_count=$2,new_matches_count=$3,duration_ms=$4,billable_posts=$2,cost_cents=$5 where id=$1",[run,billable,count,Date.now()-start,charge]);await c.query("delete from scan_jobs where radar_id=$1",[r.id]);return true})}
+export async function readLimits(c:PoolClient,id:string){return PLANS[entitlement((await c.query("select * from subscriptions where user_id=$1",[id])).rows[0])]}
