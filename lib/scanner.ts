@@ -50,8 +50,8 @@ export async function scanNext(search?: SocialSearchProvider) {
         [run, Date.now() - start, e.code, detail, e.retryable],
       );
       await c.query(
-        "update radars set last_scan_at=now(),last_error=$2,next_scan_at=now()+make_interval(secs=>$3) where id=$1",
-        [r.id, e.code, Math.max(interval, e.retryAfter, e.retryable ? 0 : 3600)],
+        "update radars set last_scan_at=now(),last_error='PROVIDER_DELAYED',next_scan_at=now()+make_interval(secs=>$2) where id=$1",
+        [r.id, Math.max(interval, e.retryAfter, e.retryable ? 0 : 3600)],
       );
       await c.query("delete from scan_jobs where radar_id=$1", [r.id]);
       console.error(JSON.stringify({ event: "provider_scan_failed", scan_run_id: run, radar_id: r.id, provider: r.provider, code: e.code, detail, retryable: e.retryable }));
