@@ -1,0 +1,25 @@
+{
+  "name": "replyradar-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx --env-file-if-exists=.env.local worker/index.ts",
+    "worker": "node --import tsx --env-file-if-exists=.env.local worker/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ioredis": "6.0.0",
+    "pg": "8.23.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "26.4.1",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.13",
+    "typescript": "6.0.3"
+  }
+}
